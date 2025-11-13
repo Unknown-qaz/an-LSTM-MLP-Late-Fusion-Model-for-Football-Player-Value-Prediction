@@ -1,0 +1,128 @@
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+SAMPLES_CSV = "samples_index.csv"
+SEQS_CSV    = "sequences.csv"
+
+VALUE_SCALE = 1e6
+GLOBAL_SEED = 3407
+np.random.seed(GLOBAL_SEED)
+
+SEQ_TECH_STATS = [
+    "Gls","Ast","Sh","SoT","PK","PKatt",
+    "CrdY","CrdR",
+    "xG","npxG","xAG","SCA","GCA",
+    "Cmp","Att","PrgP","Carries","PrgC","Att.1","Succ",
+]
+SEQ_CONTEXT = ["Start","Min","ResultOutcome"]
+SEQ_ELO     = ["TeamElo","OppElo"]
+SEQ_POS     = ["Pos_GK","Pos_DF","Pos_MF","Pos_FW"]
+
+STATIC_AGE   = ["AgeAtSeasonStart"]
+STATIC_INJ   = ["InjuryDays_log1p", "GamesMissed_log1p", "InjuryCount_log1p"]
+STATIC_INITVAL_LOG = ["InitValue_log"]
+
+def metrics_reg(y_true, y_pred):
+    mae  = float(mean_absolute_error(y_true, y_pred))
+    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+    mape = float(np.mean(np.abs(y_true - y_pred) / np.maximum(np.abs(y_true), 1e-6)))
+    r2   = float(r2_score(y_true, y_pred))
+    return {"mae":mae, "rmse":rmse, "mape":mape, "r2":r2}
+
+samples = pd.read_csv(SAMPLES_CSV)
+seqs    = pd.read_csv(SEQS_CSV)
+seqs = seqs.sort_values(["SampleID","T"]).reset_index(drop=True)
+
+samples["InitValue_log"] = np.log(samples["InitMarketValue"] / VALUE_SCALE)
+for _c in ["InjuryDays", "GamesMissed", "InjuryCount"]:
+    if _c in samples.columns:
+        samples[_c] = samples[_c].fillna(0)
+        samples[f"{_c}_log1p"] = np.log1p(np.clip(samples[_c], 0, None))
+
+all_seq_cols = SEQ_CONTEXT + SEQ_TECH_STATS + SEQ_ELO + SEQ_POS
+seq_used = [c for c in all_seq_cols if c in seqs.columns]
+print(f"Using {len(seq_used)} sequence columns")
+
+seq_mean_df = seqs.groupby("SampleID")[seq_used].mean().reset_index()
+merged = samples.merge(seq_mean_df, on="SampleID", how="left")
+
+feature_cols = STATIC_AGE + STATIC_INJ + STATIC_INITVAL_LOG + seq_used
+feature_cols = [c for c in feature_cols if c in merged.columns]
+
+X = merged[feature_cols].astype(float).fillna(0)
+y = merged["FinalMarketValue"].astype(float)
+y_log = np.log(y / VALUE_SCALE)
+
+train_ids = merged.loc[merged["Split"]=="train","SampleID"]
+val_ids   = merged.loc[merged["Split"]=="val","SampleID"]
+test_ids  = merged.loc[merged["Split"]=="test","SampleID"]
+
+X_train = X[merged["SampleID"].isin(train_ids)]
+X_val   = X[merged["SampleID"].isin(val_ids)]
+X_test  = X[merged["SampleID"].isin(test_ids)]
+
+y_train = y_log[merged["SampleID"].isin(train_ids)]
+y_val   = y_log[merged["SampleID"].isin(val_ids)]
+y_test  = y_log[merged["SampleID"].isin(test_ids)]
+
+scaler = StandardScaler().fit(X_train)
+X_train_std = scaler.transform(X_train)
+X_val_std   = scaler.transform(X_val)
+X_test_std  = scaler.transform(X_test)
+
+models = {
+    "LinearRegression": LinearRegression(),
+    "Ridge": Ridge(alpha=1.0, random_state=GLOBAL_SEED),
+    "RandomForest": RandomForestRegressor(n_estimators=300, max_depth=None, random_state=GLOBAL_SEED, n_jobs=-1),
+    "XGBoost": XGBRegressor(n_estimators=500, learning_rate=0.05, max_depth=6, subsample=0.8,
+                            colsample_bytree=0.8, random_state=GLOBAL_SEED, tree_method="hist")
+}
+
+all_rows = []
+
+def from_target(y_log):
+    return np.exp(y_log) * VALUE_SCALE
+
+for name, model in models.items():
+    print(f"\n===== Training model：{name} =====")
+    model.fit(X_train_std, y_train)
+
+    results = {}
+    for split, Xs, ys in [("train", X_train_std, y_train),
+                          ("val",   X_val_std,   y_val),
+                          ("test",  X_test_std,  y_test)]:
+        y_pred_log = model.predict(Xs)
+        y_pred_eur = from_target(y_pred_log)
+        y_true_eur = from_target(ys)
+        m = metrics_reg(y_true_eur, y_pred_eur)
+        results[split] = m
+
+        df_out = pd.DataFrame({
+            "SampleID": merged.loc[merged["Split"]==split, "SampleID"].values,
+            "y_true": np.round(y_true_eur,2),
+            "y_pred": np.round(y_pred_eur,2)
+        })
+        df_out["abs_err"] = np.round(np.abs(df_out["y_pred"] - df_out["y_true"]), 2)
+        df_out["pct_err"] = np.where(np.abs(df_out["y_true"])>1e-6,
+                                     np.round(df_out["abs_err"]/np.abs(df_out["y_true"]),4),
+                                     np.nan)
+        df_out.to_csv(f"baseline_pred_{name}_{split}.csv", index=False)
+
+    row = [name]
+    for sp in ["train","val","test"]:
+        row += [results[sp]["mae"], results[sp]["rmse"], results[sp]["mape"], results[sp]["r2"]]
+    all_rows.append(row)
+
+cols = (["model"] +
+        ["train_mae","train_rmse","train_mape","train_r2"] +
+        ["val_mae","val_rmse","val_mape","val_r2"] +
+        ["test_mae","test_rmse","test_mape","test_r2"])
+df_metrics = pd.DataFrame(all_rows, columns=cols)
+df_metrics.to_csv("baseline_metrics.csv", index=False)
+print("\nSaved：baseline_metrics.csv")
+display(df_metrics)

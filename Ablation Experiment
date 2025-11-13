@@ -1,0 +1,412 @@
+import os, json, random, math, gc, re
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+SAMPLES_CSV = "samples_index.csv"
+SEQS_CSV    = "sequences.csv"
+
+GLOBAL_SEED = 3407
+BATCH_SIZE  = 64
+EPOCHS      = 80
+LR          = 1e-3
+HIDDEN_SIZE = 128
+NUM_LAYERS  = 1
+DROPOUT     = 0.1
+PATIENCE    = 10
+
+VALUE_SCALE = 1e6
+
+def to_target(v_eur: float) -> float:
+    return float(np.log(v_eur / VALUE_SCALE))
+
+def from_target(y: np.ndarray) -> np.ndarray:
+    return np.exp(y) * VALUE_SCALE
+
+MIN_MATCHES = 0
+MAX_MATCHES = None
+MIN_MINUTES = 0
+MAX_MINUTES = None
+
+DROP_DERIVED_PERCENT = True
+HIGH_CORR_THRES      = 1
+
+SEQ_TECH_STATS = [
+    "Gls","Ast","Sh","SoT","PK","PKatt",
+    "CrdY","CrdR",
+    "xG","npxG","xAG","SCA","GCA",
+    "Cmp","Att","PrgP","Carries","PrgC","Att.1","Succ",
+]
+SEQ_CONTEXT = ["Start","Min","ResultOutcome"]
+SEQ_ELO     = ["TeamElo","OppElo"]
+SEQ_POS     = ["Pos_GK","Pos_DF","Pos_MF","Pos_FW"]
+
+STATIC_AGE   = ["AgeAtSeasonStart"]
+STATIC_INJ   = ["InjuryDays_log1p", "GamesMissed_log1p", "InjuryCount_log1p"]
+STATIC_INITVAL_LOG = ["InitValue_log"]
+
+def set_seed(seed=42):
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+set_seed(GLOBAL_SEED)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+def metrics_reg(y_true_eur, y_pred_eur):
+    mae  = float(np.mean(np.abs(y_true_eur - y_pred_eur)))
+    rmse = float(np.sqrt(np.mean((y_true_eur - y_pred_eur)**2)))
+    mape = float(np.mean(np.abs(y_true_eur - y_pred_eur) / np.maximum(np.abs(y_true_eur), 1e-6)))
+    ss_res = float(np.sum((y_true_eur - y_pred_eur) ** 2))
+    ss_tot = float(np.sum((y_true_eur - np.mean(y_true_eur)) ** 2) + 1e-9)
+    r2 = 1.0 - ss_res/ss_tot
+    return {"mae":mae, "rmse":rmse, "mape":mape, "r2":r2}
+
+samples = pd.read_csv(SAMPLES_CSV)
+seqs    = pd.read_csv(SEQS_CSV)
+seqs = seqs.sort_values(["SampleID","T"]).reset_index(drop=True)
+
+assert {"SampleID","FinalMarketValue","Split","SeqLen"}.issubset(samples.columns)
+assert {"SampleID","T"}.issubset(seqs.columns)
+
+if "InitMarketValue" in samples.columns:
+    samples["InitValue_log"] = np.log(samples["InitMarketValue"] / VALUE_SCALE)
+else:
+    raise ValueError("InitMarketValue not found in samples_index.csv")
+
+for _c in ["InjuryDays", "GamesMissed", "InjuryCount"]:
+    if _c in samples.columns:
+        samples[_c] = samples[_c].fillna(0)
+        samples[f"{_c}_log1p"] = np.log1p(np.clip(samples[_c], 0, None))
+
+before_n = len(samples)
+keep = pd.Series(True, index=samples.index)
+if MIN_MATCHES:
+    keep &= (samples["SeqLen"] >= int(MIN_MATCHES))
+if MAX_MATCHES is not None:
+    keep &= (samples["SeqLen"] <= int(MAX_MATCHES))
+if MIN_MINUTES and "MinutesTotal" in samples.columns:
+    keep &= (samples["MinutesTotal"] >= int(MIN_MINUTES))
+if MAX_MINUTES is not None and "MinutesTotal" in samples.columns:
+    keep &= (samples["MinutesTotal"] <= int(MAX_MINUTES))
+
+samples = samples[keep].copy()
+seqs    = seqs[seqs["SampleID"].isin(samples["SampleID"])].copy()
+after_n = len(samples)
+print(f"Sample filter: {before_n} -> {after_n}  (min_matches={MIN_MATCHES}, max_matches={MAX_MATCHES}, "
+      f"min_minutes={MIN_MINUTES}, max_minutes={MAX_MINUTES})")
+
+init_log_map  = dict(zip(samples["SampleID"], samples["InitValue_log"]))
+init_eur_map  = dict(zip(samples["SampleID"], samples["InitMarketValue"]))
+final_eur_map = dict(zip(samples["SampleID"], samples["FinalMarketValue"]))
+
+train_ids = samples.loc[samples["Split"]=="train","SampleID"].tolist()
+val_ids   = samples.loc[samples["Split"]=="val","SampleID"].tolist()
+test_ids  = samples.loc[samples["Split"]=="test","SampleID"].tolist()
+print(f"Split: train={len(train_ids)}, val={len(val_ids)}, test={len(test_ids)}")
+assert len(train_ids)>0 and len(val_ids)>0 and len(test_ids)>0
+
+def drop_high_corr_cols(df, cols, thres=0.98):
+    use = [c for c in cols if c in df.columns]
+    if len(use) <= 1:
+        return use
+    X = df[use].astype(float).replace([np.inf, -np.inf], np.nan)
+    X = X.fillna(X.mean())
+    nunique = X.nunique()
+    const_cols = set(nunique[nunique<=1].index)
+    keep_cols = [c for c in use if c not in const_cols]
+    if len(keep_cols) <= 1:
+        if len(const_cols)>0:
+            print(f"Removed constant cols: {sorted(const_cols)}")
+        return keep_cols
+
+    corr = pd.DataFrame(np.corrcoef(X[keep_cols].values, rowvar=False), index=keep_cols, columns=keep_cols)
+    to_drop = set()
+    for i, c1 in enumerate(keep_cols):
+        if c1 in to_drop:
+            continue
+        for j in range(i+1, len(keep_cols)):
+            c2 = keep_cols[j]
+            if c2 in to_drop:
+                continue
+            v = corr.iloc[i, j]
+            if pd.notna(v) and abs(v) > thres:
+                keep_c, drop_c = c1, c2
+                if (len(c2) < len(c1)) or (re.search(r'[%/]', c1) and not re.search(r'[%/]', c2)):
+                    keep_c, drop_c = c2, c1
+                to_drop.add(drop_c)
+    pruned = [c for c in keep_cols if c not in to_drop]
+    if len(const_cols)>0:
+        print(f"Removed constant cols: {sorted(const_cols)}")
+    if len(to_drop)>0:
+        print(f"Removed high-corr (|corr|>{thres}) cols: {sorted(list(to_drop))}")
+    return pruned
+
+ABLATIONS = [
+    {"name":"full",       "USE_ELO":True,  "USE_INJ":True,  "USE_AGE":True,  "USE_SEQ_TECH":True, "USE_POS":True, "USE_INITVAL":True},
+    {"name":"no_elo",     "USE_ELO":False, "USE_INJ":True,  "USE_AGE":True,  "USE_SEQ_TECH":True, "USE_POS":True, "USE_INITVAL":True},
+    {"name":"no_injury",  "USE_ELO":True,  "USE_INJ":False, "USE_AGE":True,  "USE_SEQ_TECH":True, "USE_POS":True, "USE_INITVAL":True},
+    {"name":"no_age",     "USE_ELO":True,  "USE_INJ":True,  "USE_AGE":False, "USE_SEQ_TECH":True, "USE_POS":True, "USE_INITVAL":True},
+    {"name":"no_seqtech", "USE_ELO":True,  "USE_INJ":True,  "USE_AGE":True,  "USE_SEQ_TECH":False,"USE_POS":True, "USE_INITVAL":True},
+    {"name":"no_pos",     "USE_ELO":True,  "USE_INJ":True,  "USE_AGE":True,  "USE_SEQ_TECH":True, "USE_POS":False, "USE_INITVAL":True},
+    {"name":"no_initval", "USE_ELO":True,  "USE_INJ":True,  "USE_AGE":True,  "USE_SEQ_TECH":True, "USE_POS":True, "USE_INITVAL":False},
+]
+
+def build_feature_lists(cfg, seq_df, samp_df):
+    cols = list(SEQ_CONTEXT)
+    if cfg["USE_SEQ_TECH"]:
+        cols += [c for c in SEQ_TECH_STATS if c in seq_df.columns]
+    if cfg["USE_ELO"]:
+        cols += [c for c in SEQ_ELO if c in seq_df.columns]
+    if cfg["USE_POS"]:
+        cols += [c for c in SEQ_POS if c in seq_df.columns]
+
+    if DROP_DERIVED_PERCENT:
+        cols = [c for c in cols if not str(c).rstrip().endswith('%')]
+
+    seq_cols = [c for c in cols if c in seq_df.columns]
+
+    static_cols = []
+    if cfg.get("USE_AGE", True):
+        static_cols += [c for c in STATIC_AGE if c in samp_df.columns]
+    if cfg.get("USE_INJ", True):
+        static_cols += [c for c in STATIC_INJ if c in samp_df.columns]
+    if cfg.get("USE_INITVAL", True):
+        static_cols += [c for c in STATIC_INITVAL_LOG if c in samp_df.columns]
+
+    return seq_cols, static_cols
+
+def fit_scalers(seq_cols, static_cols, id_list):
+    train_seq = seqs[seqs["SampleID"].isin(id_list)][seq_cols].astype(float).values
+    seq_mean = np.nanmean(train_seq, axis=0); seq_std = np.nanstd(train_seq, axis=0); seq_std[seq_std==0]=1.0
+    if len(static_cols)>0:
+        train_static = samples[samples["SampleID"].isin(id_list)][static_cols].astype(float).values
+        stat_mean = np.nanmean(train_static, axis=0); stat_std = np.nanstd(train_static, axis=0); stat_std[stat_std==0]=1.0
+    else:
+        stat_mean = np.array([]); stat_std = np.array([])
+    return seq_mean, seq_std, stat_mean, stat_std
+
+def standardize_arr(X, mean, std):
+    X = np.where(np.isnan(X), mean, X)
+    return (X - mean) / std
+
+def build_cache(seq_cols, static_cols, seq_mean, seq_std, stat_mean, stat_std, id_list):
+    cache = {}
+    for sid in id_list:
+        g = seqs[seqs["SampleID"]==sid]
+        if len(g)==0:
+            continue
+        X_seq = g[seq_cols].astype(float).values
+        X_seq = np.where(np.isnan(X_seq), seq_mean, X_seq)
+        X_seq = (X_seq - seq_mean) / seq_std
+
+        if len(static_cols)>0:
+            st_df = samples.loc[samples["SampleID"]==sid, static_cols]
+            if len(st_df)==0:
+                x_static = np.zeros(len(static_cols), dtype=np.float32)
+            else:
+                x_static = st_df.iloc[0].astype(float).values
+                x_static = standardize_arr(x_static, stat_mean, stat_std)
+        else:
+            x_static = np.zeros(0, dtype=np.float32)
+
+        val_eur = float(samples.loc[samples["SampleID"]==sid, "FinalMarketValue"].iloc[0])
+        y = to_target(val_eur)
+
+        cache[sid] = {
+            "X_seq": X_seq.astype(np.float32),
+            "x_static": x_static.astype(np.float32),
+            "len": X_seq.shape[0],
+            "y": np.array([y], dtype=np.float32)
+        }
+    return cache
+
+class SeqDataset(Dataset):
+    def __init__(self, id_list, cache):
+        self.ids = [sid for sid in id_list if sid in cache]
+        self.cache = cache
+    def __len__(self):
+        return len(self.ids)
+    def __getitem__(self, idx):
+        sid = self.ids[idx]
+        X_seq = self.cache[sid]["X_seq"]
+        x_static = self.cache[sid]["x_static"]
+        L = self.cache[sid]["len"]
+        y = self.cache[sid]["y"]
+        return sid, torch.from_numpy(X_seq), torch.from_numpy(x_static), torch.tensor(L, dtype=torch.long), torch.from_numpy(y)
+
+def collate_batch(batch):
+    sids, Xseqs, Xstats, Ls, ys = zip(*batch)
+    Ls = torch.stack(Ls)
+    ys = torch.stack(ys).squeeze(-1)
+
+    Ls_sorted, idxs = torch.sort(Ls, descending=True)
+    sids = [sids[i] for i in idxs]
+    Xseqs = [Xseqs[i] for i in idxs]
+    Xstats = torch.stack([Xstats[i] for i in idxs])
+    ys = ys[idxs]
+
+    Tm = int(Ls_sorted[0].item()); Fseq = Xseqs[0].shape[-1]
+    X_pad = torch.zeros(len(batch), Tm, Fseq, dtype=torch.float32)
+    for i, x in enumerate(Xseqs):
+        t = x.shape[0]
+        X_pad[i,:t,:] = x
+
+    return sids, X_pad, Xstats, Ls_sorted, ys
+
+class LSTMLateFusion(nn.Module):
+    def __init__(self, seq_input_dim, static_input_dim, hidden_size=128, num_layers=1, dropout=0.1):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=seq_input_dim, hidden_size=hidden_size,
+            num_layers=num_layers, batch_first=True,
+            dropout=dropout if num_layers>1 else 0.0, bidirectional=False
+        )
+        self.static_mlp = nn.Sequential(
+            nn.Linear(static_input_dim if static_input_dim>0 else 1, hidden_size//2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size//2, hidden_size//2),
+            nn.ReLU()
+        )
+        fuse_dim = hidden_size + (hidden_size//2 if static_input_dim>0 else 0)
+        self.head = nn.Sequential(
+            nn.Linear(fuse_dim, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 1)
+        )
+
+    def forward(self, x_seq, lengths, x_static):
+        packed = nn.utils.rnn.pack_padded_sequence(x_seq, lengths.cpu(), batch_first=True, enforce_sorted=True)
+        _, (h_n, _) = self.lstm(packed)
+        h_seq = h_n[-1]
+
+        if x_static is None or x_static.numel() == 0:
+            x_static_in = torch.ones(x_seq.size(0), 1, device=x_seq.device)
+        else:
+            x_static_in = x_static
+        h_sta = self.static_mlp(x_static_in)
+
+        h = torch.cat([h_seq, h_sta], dim=1)
+        out = self.head(h).squeeze(-1)
+        return out
+
+def run_one_cfg(cfg):
+    print("\n===== Config:", cfg, "=====")
+
+    seq_cols, static_cols = build_feature_lists(cfg, seqs, samples)
+    assert len(seq_cols)>0, "No sequential features available under this config."
+    print("Sequential features:", seq_cols)
+    print("Static features:", static_cols)
+
+    train_seq_df = seqs[seqs["SampleID"].isin(train_ids)][seq_cols].copy()
+    pruned_seq_cols = drop_high_corr_cols(train_seq_df, seq_cols, thres=HIGH_CORR_THRES)
+    assert len(pruned_seq_cols)>0, "All sequential features removed by high-corr filtering."
+    if len(pruned_seq_cols) != len(seq_cols):
+        print(f"Sequential features: {len(seq_cols)} -> {len(pruned_seq_cols)} (after corr/pruning)")
+    seq_cols = pruned_seq_cols
+
+    seq_mean, seq_std, stat_mean, stat_std = fit_scalers(seq_cols, static_cols, train_ids)
+
+    cache_tr = build_cache(seq_cols, static_cols, seq_mean, seq_std, stat_mean, stat_std, train_ids)
+    cache_va = build_cache(seq_cols, static_cols, seq_mean, seq_std, stat_mean, stat_std, val_ids)
+    cache_te = build_cache(seq_cols, static_cols, seq_mean, seq_std, stat_mean, stat_std, test_ids)
+
+    train_loader = DataLoader(SeqDataset(train_ids, cache_tr), batch_size=BATCH_SIZE, shuffle=True,  collate_fn=collate_batch)
+    val_loader   = DataLoader(SeqDataset(val_ids,   cache_va), batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_batch)
+    test_loader  = DataLoader(SeqDataset(test_ids,  cache_te), batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_batch)
+
+    seq_input_dim  = len(seq_cols)
+    static_input_dim = len(static_cols)
+    model = LSTMLateFusion(seq_input_dim, static_input_dim, HIDDEN_SIZE, NUM_LAYERS, DROPOUT).to(device)
+
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+
+    best_val = float("inf"); best_state=None; pat=0
+    def eval_loader(loader):
+        model.eval(); preds=[]; trues=[]; sids=[]
+        with torch.no_grad():
+            for sid_list, X, Xs, L, y in loader:
+                X = X.to(device); Xs = Xs.to(device); y = y.to(device)
+                out = model(X, L, Xs)
+                preds.append(out.cpu().numpy()); trues.append(y.cpu().numpy()); sids += sid_list
+
+        preds = np.concatenate(preds); trues = np.concatenate(trues)
+        mse_log  = float(np.mean((preds - trues)**2))
+        rmse_log = float(np.sqrt(mse_log))
+
+        preds_eur = from_target(preds)
+        trues_eur = from_target(trues)
+        m_eur = metrics_reg(trues_eur, preds_eur)
+
+        return {"rmse_log": rmse_log, "mse_log": mse_log, **m_eur}, preds_eur, trues_eur, sids
+
+    for ep in range(1, EPOCHS + 1):
+        model.train()
+        tot = 0.0; n = 0
+        for _, X, Xs, L, y in train_loader:
+            X = X.to(device); Xs = Xs.to(device); y = y.to(device)
+            optimizer.zero_grad()
+            out = model(X, L, Xs)
+            loss = criterion(out, y)
+            loss.backward()
+            optimizer.step()
+            tot += loss.item() * X.size(0); n += X.size(0)
+
+        train_mse = tot / max(n, 1)
+        val_m,_,_,_ = eval_loader(val_loader)
+        print(f"Cfg[{cfg['name']}] Ep{ep:03d}  train_mse_log={train_mse:.4f}  "
+              f"val_RMSE_log={val_m['rmse_log']:.4f}  val_RMSE_eur={val_m['rmse']:.1f}  val_R2_eur={val_m['r2']:.4f}")
+
+        if val_m["rmse_log"] < best_val - 1e-6:
+            best_val = val_m["rmse_log"]
+            best_state = {k:v.cpu().clone() for k,v in model.state_dict().items()}
+            pat = 0
+        else:
+            pat += 1
+            if pat >= PATIENCE:
+                print("Early stop.")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    torch.save(model.state_dict(), f"lstm_{cfg['name']}_best.pt")
+
+    out_metrics = {}
+    for split, loader in [("train", train_loader), ("val", val_loader), ("test", test_loader)]:
+        m, pred_eur, true_eur, sids = eval_loader(loader)
+        out_metrics[split] = m
+        df_out = pd.DataFrame({"SampleID": sids,
+                               "y_true": np.round(true_eur,2),
+                               "y_pred": np.round(pred_eur,2)})
+        df_out["abs_err"] = np.round(np.abs(df_out["y_pred"]-df_out["y_true"]),2)
+        df_out["pct_err"] = np.where(np.abs(df_out["y_true"])>1e-6,
+                                     np.round(df_out["abs_err"]/np.abs(df_out["y_true"]),4),
+                                     np.nan)
+        df_out.to_csv(f"ablation_pred_{cfg['name']}_{split}.csv", index=False)
+    return out_metrics
+
+all_rows = []
+for cfg in ABLATIONS:
+    set_seed(GLOBAL_SEED)
+    m = run_one_cfg(cfg)
+    row = [cfg["name"]]
+    for sp in ["train","val","test"]:
+        row += [m[sp]["rmse_log"], m[sp]["mae"], m[sp]["rmse"], m[sp]["mape"], m[sp]["r2"]]
+    all_rows.append(row)
+
+cols = (["cfg"] +
+        ["train_rmse_log"] + [f"train_{k}" for k in ["mae","rmse","mape","r2"]] +
+        ["val_rmse_log"]   + [f"val_{k}"   for k in ["mae","rmse","mape","r2"]] +
+        ["test_rmse_log"]  + [f"test_{k}"  for k in ["mae","rmse","mape","r2"]])
+
+ablation_df = pd.DataFrame(all_rows, columns=cols)
+ablation_df.to_csv("ablation_metrics.csv", index=False)
+print("\nSaved: ablation_metrics.csv")
+display(ablation_df)
